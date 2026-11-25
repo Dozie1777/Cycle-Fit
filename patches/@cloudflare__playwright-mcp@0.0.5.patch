@@ -1,0 +1,56 @@
+diff --git a/lib/cjs/index.js b/lib/cjs/index.js
+index 04caf67434a312b5245883edfa2be2a762c374c9..862213d86ec74ad56c5053fbc1a8f2c5f0b20dfe 100644
+--- a/lib/cjs/index.js
++++ b/lib/cjs/index.js
+@@ -8,16 +8,16 @@ const index = require('./src/index.js');
+ 
+ function createMcpAgent(endpoint, options) {
+   const cdpEndpoint = typeof endpoint === "string" ? endpoint : endpoint instanceof URL ? endpoint.toString() : playwright.endpointURLString(endpoint);
+-  const connection = index.createConnection({
+-    capabilities: ["core", "tabs", "pdf", "history", "wait", "files", "testing"],
+-    browser: {
+-      cdpEndpoint
+-    },
+-    ...options
+-  });
+   return class PlaywrightMcpAgent extends mcp.McpAgent {
+     constructor() {
+       super(...arguments);
++      const connection = index.createConnection({
++        capabilities: ["core", "tabs", "pdf", "history", "wait", "files", "testing"],
++        browser: {
++          cdpEndpoint
++        },
++        ...options
++      });
+       this.server = connection.then((server) => server.server);
+     }
+     async init() {
+diff --git a/lib/esm/index.js b/lib/esm/index.js
+index 7d0422d1693166fc9b2aac833df6c25eccae85be..b561f151cf5f98caacb87dd4c274467f52618d9e 100644
+--- a/lib/esm/index.js
++++ b/lib/esm/index.js
+@@ -4,16 +4,16 @@ import { createConnection } from './src/index.js';
+ 
+ function createMcpAgent(endpoint, options) {
+   const cdpEndpoint = typeof endpoint === "string" ? endpoint : endpoint instanceof URL ? endpoint.toString() : endpointURLString(endpoint);
+-  const connection = createConnection({
+-    capabilities: ["core", "tabs", "pdf", "history", "wait", "files", "testing"],
+-    browser: {
+-      cdpEndpoint
+-    },
+-    ...options
+-  });
+   return class PlaywrightMcpAgent extends McpAgent {
+     constructor() {
+       super(...arguments);
++      const connection = createConnection({
++        capabilities: ["core", "tabs", "pdf", "history", "wait", "files", "testing"],
++        browser: {
++          cdpEndpoint
++        },
++        ...options
++      });
+       this.server = connection.then((server) => server.server);
+     }
+     async init() {

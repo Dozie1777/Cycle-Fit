@@ -1,0 +1,1118 @@
+// Agent credentials + Better Auth schema for the code-review-bot worker.
+//
+// D1 is SQLite, so the datasource is `sqlite` with a driver adapter
+// (@prisma/adapter-d1). The datasource url lives in prisma.config.ts
+// (DATABASE_URL) — it is only used by the Prisma CLI; at runtime the
+// adapter binds to the D1Database binding (env.DB).
+//
+// Regenerate the client with: npx prisma generate
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+  runtime  = "cloudflare"
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+// ---------------------------------------------------------------------------
+// App-owned model
+// ---------------------------------------------------------------------------
+
+/// A registered bot identity. Agents are Better Auth users with role `agent`
+/// and no login capability; credentials are outbound actor identities only and
+/// never participate in webhook signature verification.
+model AgentCredential {
+  id         String   @id @default(cuid())
+  agentId    String
+  agent      user     @relation(fields: [agentId], references: [id])
+  provider   String // 'github_app' now; 'linear' etc. later
+  /// GitHub installation id — present on every installation-scoped webhook and
+  /// needed to mint installation tokens. Not a secret; plaintext + indexed.
+  externalId String?
+  /// Permission envelope verified at registration: 'pusher' | 'reviewer'.
+  envelope   String
+  /// base64(fmt(1) || nonce(12) || ciphertext+tag) of JSON
+  /// { appId, privateKey, botLogin, botEmail }; AAD = `${id}:${keyVersion}`.
+  payloadEnc String
+  keyVersion Int      @default(1)
+  status     String   @default("active") // 'active' | 'disabled'
+  lastUsedAt DateTime?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  // The unique index on (provider, externalId) already covers equality lookups
+  // on the leftmost columns — no plain index needed.
+  @@unique([provider, externalId])
+}
+
+/// Review launch states: creating (no run ID), created (run ID recorded,
+/// launch pending), started (process launched, lease cleared). Expired creating
+/// claims are replaced; expired created claims resume with the existing run ID.
+model ReviewClaim {
+  id         String @id
+  repository String
+  headSha    String
+  deliveryId String @unique
+  checkRunId Int?
+  state      String @default("creating")
+  /// SHA-256 of the separate per-attempt sandbox credential; never the plaintext.
+  secretHash String?
+  leaseUntil DateTime?
+  createdAt  DateTime @default(now())
+
+  @@unique([repository, headSha])
+}
+
+/// The same launch states for intentional rerequests. Each delivery has its own
+/// attempt workspace; the highest rowid for a check run fences stale attempts.
+model ReviewDeliveryClaim {
+  id         String @id
+  deliveryId String @unique
+  checkRunId Int?
+  state      String @default("creating")
+  processId  String?
+  /// SHA-256 of the separate per-attempt sandbox credential; never the plaintext.
+  secretHash String?
+  leaseUntil DateTime?
+  createdAt  DateTime @default(now())
+}
+
+/// A project is a container grouping related design workspaces. Rows carry
+/// only continuity data (name + description); authored artifacts live per
+/// design under the DESIGNS R2 bucket.
+model Project {
+  id          String   @id @default(cuid())
+  name        String
+  description String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  designs   Design[]
+  campaigns Campaign[]
+  assets  Asset[]
+  brandKit BrandKit?
+  /// Per-element design chat sessions (KUK-940).
+  elementChats ElementChat[]
+  /// Normalized building-block model (KUK-917).
+  designSystem    DesignSystem?
+  dataCollections DataCollection[]
+  components      Component[]
+  templates       Template[]
+  pages           Page[]
+  flows           Flow[]
+}
+
+/// A design workspace: one chat session whose agent authors design files that
+/// it then publishes into the DESIGNS R2 bucket under this id. Rows only carry
+/// continuity data (the brief + timestamps) — the id doubles as the sandbox
+/// instance id for the legacy terminal flow. A design may belong to a project
+/// (filed) or stand alone (nullable projectId = unfiled).
+model Design {
+  id          String   @id
+  prompt      String
+  /// Bearer token injected into the sandbox session env; the agent posts it to
+  /// POST /designs/:id/upload-url to receive a presigned PUT URL. Nullable so
+  /// pre-feature rows survive; the uploads route rejects projects without one.
+  uploadToken String?
+  /// Container-free chat pipeline: chatting while a turn is streaming,
+  /// ready after a published turn, failed when a turn errored. The
+  /// interactive terminal flow (kept in parallel) does not use this.
+  status String @default("ready")
+  /// Last chat failure message, shown in the admin UI (null on success).
+  error String?
+  /// Current turn owner; terminal updates must match this before clearing it.
+  activeTurnId String?
+  /// Claim time for the 45-minute abandoned-turn recovery lease.
+  turnClaimedAt DateTime?
+  /// Publication attempt whose staged artifacts are currently live.
+  liveTurnId String?
+  /// Design this was forked from via POST /share/:id/remix (null for original
+  /// projects). The studio skips the empty-history auto-brief for remix forks
+  /// so the user steers the first turn instead of regenerating over the fork.
+  /// Intentionally not a FK relation: forks are independent copies (files are
+  /// duplicated at remix time), so deleting the original may leave this
+  /// dangling — it is informational metadata, never joined or cascaded.
+  remixedFromId String?
+  /// Owning project container. Every design is always filed: creation
+  /// requires a container (POST /designs { projectId } or
+  /// POST /projects/:id/designs) and move-to-project cannot unfile.
+  /// Nullable at the storage level only because SQLite cannot alter
+  /// nullability in place — the legacy NULL rows were already backfilled
+  /// (into the "General" container) in production, and the API rejects
+  /// unfiled rows.
+  projectId String?
+  project Project? @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  messages   Message[]
+  assets     Asset[]
+  assetLinks DesignAsset[]
+  /// Campaign membership (null for plain design workspaces). Deleting the
+  /// campaign detaches (SetNull) and the design stays filed in its project.
+  campaignId String?
+  campaign   Campaign? @relation(fields: [campaignId], references: [id], onDelete: SetNull)
+  /// Calendar slots this design is attached to as a campaign asset.
+  calendarEvents CalendarEvent[]
+  /// Building-block artifacts authored in this workspace (KUK-917).
+  pages        Page[]
+  publications Publication[]
+
+  @@index([projectId, createdAt])
+  @@index([campaignId])
+}
+
+/// One turn of a container chat (design studio, campaign studio, and
+/// per-element design chats). History is replayed as model context on every
+/// new turn. The shared table exists because the chat pipelines are
+/// identical (streaming protocol, history replay, turn lease). Ownership is
+/// exactly-one: `designId`, `campaignId`, and `elementId`
+/// are mutually exclusive — a DB CHECK constraint rejects rows with more
+/// than one or none, and the chat pipelines validate before insert
+/// (lib/message-owner.ts).
+model Message {
+  id         String   @id
+  designId   String?
+  campaignId String?
+  /// Owning ElementChat session (per-element design chats, KUK-940) —
+  /// mutually exclusive with designId/campaignId.
+  elementId  String?
+  role       String
+  content    String
+  /// JSON snapshot of the assets attached to a user turn:
+  /// [{ id, kind, filename, contentType, description, width, height,
+  ///  durationSec, url }]. Stamped from the Asset row at send time (never
+  /// trusted from the client) so history replay stays a pure string read and
+  /// survives asset deletion. Null on assistant messages and pre-feature rows.
+  attachments String?
+  /// JSON array of the assistant turn's UIMessage parts (reasoning text and
+  /// tool calls with their inputs/outputs) — everything the live stream
+  /// rendered that the flat `content` string cannot carry. The client
+  /// rebuilds the transcript from it on refresh (parseStoredParts) and falls
+  /// back to `content`-as-text when null. Null on user messages, pre-feature
+  /// rows, and turns whose parts overflow the storage-fit guard.
+  parts       String?
+  createdAt DateTime @default(now())
+
+  design    Design?      @relation(fields: [designId], references: [id], onDelete: Cascade)
+  campaign  Campaign?    @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  element   ElementChat? @relation(fields: [elementId], references: [id], onDelete: Cascade)
+
+  @@index([designId, createdAt])
+  @@index([campaignId, createdAt])
+  @@index([elementId, createdAt])
+}
+
+/// A per-element design chat session (KUK-940): one scoped chat per design
+/// element (component / page / template / data collection / flow) inside a
+/// project. The row holds the element chat's turn lease (same semantics as
+/// Design/Campaign: claim on turn start, abandoned-lease reclaim, terminal
+/// fencing) plus the distilled element context prompt that seeds the chat's
+/// system prompt. `elementType` + `elementId` are a polymorphic reference to
+/// the element row (Component / Page / Template / DataCollection / Flow) — no
+/// FK, validated in handlers; deleting the element leaves the session row
+/// (it is per-project data, and element deletion is soft for components).
+model ElementChat {
+  id         String    @id
+  projectId  String
+  /// component | page | template | data | flow — validated in handlers.
+  elementType String
+  /// The element row's id (polymorphic target; no FK — see model comment).
+  elementId  String
+  /// Current turn owner; updates must match before clearing (45-min lease).
+  activeTurnId  String?
+  turnClaimedAt DateTime?
+  /// Container-free chat pipeline states, same semantics as Design.status:
+  /// chatting while a turn is streaming, ready after a turn, failed on error.
+  status      String    @default("ready")
+  /// Last chat failure message, shown in the studio UI (null on success).
+  error       String?
+  /// Distilled element context (element's own definition + neighbors +
+  /// project tokens/brand kit) seeded at creation by the context builders;
+  /// prepended to the element chat's system prompt each turn.
+  contextPrompt String
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  project  Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  messages Message[]
+
+  @@unique([projectId, elementType, elementId])
+  @@index([projectId])
+}
+
+/// A marketing campaign: one planning chat plus its structured artifacts
+/// (brief, plans + phases, content calendar, reports) and generated design
+/// assets. Rows carry continuity data only — the id doubles as the chat
+/// session id and (later) the campaign R2 prefix. Always filed: creation
+/// requires a project container (POST /campaigns { projectId } or
+/// POST /projects/:id/campaigns) and move-to-project cannot unfile — the
+/// same contract as Design.
+model Campaign {
+  id          String  @id
+  name        String
+  /// Initial planning prompt, like Design.prompt. Seeded from the create
+  /// dialog; the studio auto-starts the first chat turn from it.
+  briefPrompt String?
+  /// Container-free chat pipeline states, same semantics as Design.status:
+  /// chatting while a turn is streaming, ready after a turn, failed on error.
+  status      String  @default("ready")
+  /// Last chat failure message, shown in the admin UI (null on success).
+  error       String?
+  /// Current turn owner; updates must match before clearing (45-min lease).
+  activeTurnId  String?
+  turnClaimedAt DateTime?
+  /// Public share slug (rotatable). Null = not shared; rotation invalidates
+  /// old links; shareRevokedAt records the last revoke for the dashboard.
+  shareSlug         String?   @unique
+  shareRevokedAt    DateTime?
+  /// Public share page shows reports/KPIs only when the owner opted in.
+  shareIncludeReports Boolean @default(false)
+
+  /// Owning project container (required — campaigns are always filed).
+  projectId String
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  brief   CampaignBrief?
+  plans   CampaignPlan[]
+  events  CalendarEvent[]
+  reports CampaignReport[]
+  messages Message[]
+  assets   Design[]
+  /// Per-campaign target audiences (structured segmentation rows; a campaign
+  /// can hold several). Replaces the deprecated CampaignBrief.audience
+  /// markdown as the source of truth for who the campaign targets.
+  audiences TargetAudience[]
+  /// Campaign ↔ channel links (KUK-890): the brief's channel mix as real
+  /// M:N data, replacing the deprecated free-text CampaignBrief.channels.
+  channelLinks CampaignChannel[]
+  /// Optional campaign target end date.
+  targetEndDate DateTime?
+  /// Structured KPI targets, replacing the deprecated CampaignBrief.kpis markdown.
+  kpis CampaignKpi[]
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([projectId, createdAt])
+}
+
+/// The campaign foundation document (1:1). Structured fields drive the
+/// dashboard's KPI strip and asset seeding; `body` carries freeform prose.
+/// Written by the agent's save_brief/update_brief tools and editable in the
+/// campaign studio — same row, one source of truth.
+model CampaignBrief {
+  id         String  @id
+  campaignId String  @unique
+  objective  String?
+  /// DEPRECATED: free-form ICP/segments markdown. Kept for legacy display
+  /// only — the source of truth for target audiences is the per-campaign
+  /// TargetAudience rows (created/edited through the agent's audience tools
+  /// and the studio audiences editor). No UI or tool writes this column
+  /// anymore; unmigrated rows render gray as a legacy fallback.
+  audience   String?
+  keyMessage String?
+  tone       String?
+  /// DEPRECATED (KUK-890): free-text channel list, e.g. "email, X, LinkedIn".
+  /// Kept this release for legacy display only — the source of truth for the
+  /// brief's channel mix is the CampaignChannel join, written through the
+  /// agent's channelIds input and the studio UI multi-select. No UI or tool
+  /// edits this column anymore.
+  channels   String?
+  budget     String?
+  /// KPIs; markdown.
+  kpis       String?
+  /// Freeform markdown prose.
+  body       String?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  campaign Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+}
+
+/// A target audience segment of a campaign: a campaign can hold several
+/// (ICP, secondary segments, ...). Per-campaign freeform rows — unlike the
+/// global Channel enumeration there is no shared library; the agent and the
+/// studio create, edit and remove them through fenced, campaign-scoped
+/// surfaces. Structured segmentation fields carry the detail the brief's
+/// deprecated `audience` markdown used to hold.
+model TargetAudience {
+  id         String  @id
+  campaignId String
+  /// Segment name, e.g. "Gen Z shoppers" or "Design leads at series-A startups".
+  name       String
+  /// Demographics — roles, industries, company size, geo; markdown bullets.
+  demographics String?
+  /// Psychographics — pain points, motivations, goals, objections; markdown.
+  psychographics String?
+  /// Funnel/buying stage, e.g. "awareness" or "decision-makers". Free text.
+  buyingStage String?
+  /// Freeform markdown notes for this segment.
+  body      String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  campaign Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+
+  @@index([campaignId])
+}
+
+/// A named plan (e.g. "Q1 launch plan"); a campaign may hold several.
+/// Structured timeline rows render directly in the dashboard — no markdown
+/// parsing.
+model CampaignPlan {
+  id         String @id
+  campaignId String
+  name       String
+  status     String @default("draft") // draft | final
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  campaign Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  phases   PlanPhase[]
+
+  @@index([campaignId])
+}
+
+/// An ordered phase of a CampaignPlan (Teaser, Launch week, Sustain, ...).
+model PlanPhase {
+  id        String   @id
+  planId    String
+  name      String
+  objective String?
+  startsAt  DateTime?
+  endsAt    DateTime?
+  /// 0-based display order; maintained server-side on reorder.
+  position  Int
+  /// Markdown detail.
+  body      String?
+
+  plan CampaignPlan @relation(fields: [planId], references: [id], onDelete: Cascade)
+
+  @@index([planId, position])
+}
+
+/// One slot of the campaign content calendar. `assetId` attaches a generated
+/// design asset (deck, landing page) to the slot; deleting the campaign
+/// detaches (SetNull) and leaves the design filed in its project.
+model CalendarEvent {
+  id          String    @id
+  campaignId  String
+  title       String
+  /// DEPRECATED (KUK-890): legacy free-text channel, e.g. "email". Kept this
+  /// release for unmigrated rows and display fallback; new writes link the
+  /// enumerated Channel through channelId and never write this column.
+  channel     String?
+  /// Linked channel (KUK-890). Nullable; deleting the channel detaches
+  /// (SetNull) and the legacy text above stays as the display fallback.
+  channelId   String?
+  linkedChannel Channel? @relation(fields: [channelId], references: [id], onDelete: SetNull)
+  scheduledAt DateTime?
+  status      String    @default("planned") // planned | draft | scheduled | published
+  assetId     String?
+  asset       Design?   @relation(fields: [assetId], references: [id], onDelete: SetNull)
+  /// Markdown notes.
+  notes       String?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  campaign Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+
+  @@index([campaignId, scheduledAt])
+  @@index([channelId])
+}
+
+/// A performance report against the brief's KPIs. Reports accumulate over
+/// time (periodStart/End). Hidden from the public share page unless
+/// Campaign.shareIncludeReports is set.
+model CampaignReport {
+  id          String    @id
+  campaignId  String
+  title       String
+  periodStart DateTime?
+  periodEnd   DateTime?
+  /// One-paragraph executive summary.
+  summary     String?
+  /// KPI table; markdown.
+  metrics     String?
+  /// Full markdown report body.
+  body        String
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  campaign Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  kpiResults CampaignKpiResult[]
+
+  @@index([campaignId, createdAt])
+}
+
+/// Global channel enumeration (KUK-890). Admin-owned: channels are created,
+/// renamed and colored through the admin API/UI (POST/PATCH /channels) only —
+/// the agent picks from the enumeration with the list_channels tool but can
+/// never create one. `name` is unique; case-insensitive uniqueness is
+/// enforced in the handlers (SQLite UNIQUE is case-sensitive by design).
+model Channel {
+  id        String   @id
+  name      String   @unique
+  /// Display color for color-coded pills/swimlanes, e.g. "#3b82f6".
+  color     String?
+  createdAt DateTime @default(now())
+
+  campaignLinks  CampaignChannel[]
+  calendarEvents CalendarEvent[]
+}
+
+/// A reusable studio skill (KUK-891): a named markdown instruction module
+/// the campaign planning agent loads with the load_skill tool. The system
+/// prompt carries every enabled skill's name/slug/one-line description each
+/// turn; the full content is returned only when the agent calls load_skill
+/// (or the user invokes it with a /slug message). Admin-owned like channels:
+/// created/edited/enabled/disabled through the admin API and the
+/// manage-skills dialog — the agent can load but never create or edit.
+/// Builtin (migration-seeded) skills cannot be deleted, only disabled.
+/// Case-insensitive slug uniqueness is enforced in the handlers (SQLite
+/// UNIQUE is case-sensitive by design).
+model Skill {
+  id          String   @id
+  slug        String   @unique
+  name        String
+  description String
+  /// Full markdown instructions, returned verbatim by load_skill.
+  content     String
+  /// Which studio surfaces the skill: "design" (design studio chat) or
+  /// "campaign" / "marketing" / "sales" (campaign studio chat). Migration
+  /// seeds are categorized; admin-created skills default to "campaign".
+  category    String   @default("campaign")
+  builtin     Boolean  @default(false)
+  enabled     Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+/// M:N link between a campaign and a channel (KUK-890) — the source of truth
+/// for the brief's channel mix, replacing the deprecated free-text
+/// CampaignBrief.channels. Replaced atomically (delete-all + reinsert in one
+/// D1 batch) by the agent's channelIds input and the studio UI multi-select.
+model CampaignChannel {
+  campaignId String
+  channelId  String
+  addedAt    DateTime @default(now())
+
+  campaign Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  channel  Channel  @relation(fields: [channelId], references: [id], onDelete: Cascade)
+
+  @@id([campaignId, channelId])
+  @@index([channelId])
+}
+
+/// A structured KPI target for a campaign. Replaces the free-text
+/// CampaignBrief.kpis markdown. Each KPI has a kind (number/boolean/qualitative)
+/// and a target value matching that kind; results are recorded separately in
+/// CampaignKpiResult.
+model CampaignKpi {
+  id            String   @id @default(cuid())
+  campaignId    String
+  name          String
+  kind          String // 'number' | 'boolean' | 'qualitative'
+  targetNumber  Float?
+  targetBoolean Boolean?
+  targetText    String?
+  unit          String?
+  /// Display color for the KPI card, e.g. "#3b82f6".
+  color         String?
+  sortOrder     Int      @default(0)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  campaign Campaign          @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  results  CampaignKpiResult[]
+
+  @@index([campaignId, sortOrder])
+}
+
+/// A recorded actual result for a CampaignKpi. Multiple snapshots can be
+/// recorded over time; the latest is shown on the dashboard scorecard.
+model CampaignKpiResult {
+  id            String   @id @default(cuid())
+  kpiId         String
+  actualNumber  Float?
+  actualBoolean Boolean?
+  actualText    String?
+  status        String   @default("pending") // pending | not_met | partial | met | exceeded
+  reportId      String?
+  recordedAt    DateTime @default(now())
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  kpi    CampaignKpi    @relation(fields: [kpiId], references: [id], onDelete: Cascade)
+  report CampaignReport? @relation(fields: [reportId], references: [id], onDelete: SetNull)
+
+  @@index([kpiId, recordedAt])
+  @@index([reportId])
+}
+
+/// An uploaded reference asset (image or video). Lives in exactly one
+/// container: a project's shared library (projectId set, designId null —
+/// every design chat under the project can pull it in) or as a standalone
+/// design asset (designId set, projectId null — covers unfiled designs).
+/// Binary content lives in R2 under assets/<assetId>/<filename>; the row is
+/// the source of truth for kind, metadata, and the generated description.
+model Asset {
+  id                String  @id @default(cuid())
+  /// Owning project library; null for design-owned assets.
+  projectId         String?
+  project           Project? @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  /// Owning design for standalone assets; null for project-library assets.
+  designId          String?
+  design            Design?  @relation(fields: [designId], references: [id], onDelete: Cascade)
+  /// 'image' | 'video'
+  kind              String
+  /// Bucket key under the DESIGNS binding: assets/<assetId>/<safe-filename>.
+  r2Key             String
+  /// Display filename (original upload name, sanitized for display only).
+  filename          String
+  contentType       String
+  sizeBytes         Int
+  /// Pixel dimensions (images and videos; client-measured for videos).
+  width             Int?
+  height            Int?
+  /// Video duration in seconds (client-measured).
+  durationSec       Float?
+  /// Model-generated (images) or user-written (videos) description used as
+  /// the chat turn context. Never trusted from the client for images.
+  description       String?
+  /// pending | ready | failed (images, auto-description)
+  /// needs_description | manual (videos, user-written)
+  descriptionStatus String  @default("pending")
+  descriptionError  String?
+  /// Better Auth user id of the uploader — informational, no FK (the user
+  /// table is Better Auth-owned and cascades are not needed).
+  uploadedById      String
+  createdAt         DateTime @default(now())
+
+  designLinks DesignAsset[]
+
+  @@index([projectId, createdAt])
+  @@index([designId, createdAt])
+}
+
+/// Link from a design chat to an asset in its project's shared library.
+/// Created the first time a chat turn references the asset; compound PK
+/// prevents duplicate links.
+model DesignAsset {
+  designId  String
+  assetId   String
+  addedAt   DateTime @default(now())
+  addedById String
+
+  design Design @relation(fields: [designId], references: [id], onDelete: Cascade)
+  asset  Asset  @relation(fields: [assetId], references: [id], onDelete: Cascade)
+
+  @@id([designId, assetId])
+}
+
+/// DEPRECATED (KUK-918): superseded by DesignSystem/DesignToken — the
+/// BrandKit tables remain the write source for palettes/typography/fonts
+/// this release (a runtime sync mirrors every write into DesignToken), but
+/// they are frozen: drop in a later cleanup migration.
+/// The persistent brand layer for a design project (KUK-893): reusable
+/// palettes, typography roles, and font loading info so every design chat
+/// under the project renders from the same visual identity instead of
+/// re-deriving style each session. 1:1 with its project; children are
+/// rows-per-role (not typed columns) — the required color roles are
+/// enforced in the API's Zod validation, not in the DB.
+model BrandKit {
+  id        String   @id
+  projectId String   @unique
+  name      String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  project    Project           @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  palettes   BrandPalette[]
+  typography BrandTypography[]
+  fonts      BrandFont[]
+}
+
+/// DEPRECATED (KUK-918): superseded by DesignToken (dark palette colors
+/// are `dark-<role>` tokens) — drop in a later cleanup migration.
+/// One mode of the kit's palette. Colors are rows-per-role keyed by shadcn
+/// token names (background, foreground, primary, ...) so new roles need no
+/// migration. Deleting the kit cascades here.
+model BrandPalette {
+  id    String @id
+  kitId String
+  /// 'light' | 'dark'
+  mode  String
+
+  kit    BrandKit     @relation(fields: [kitId], references: [id], onDelete: Cascade)
+  colors BrandColor[]
+
+  @@unique([kitId, mode])
+}
+
+/// DEPRECATED (KUK-918): superseded by DesignToken (category "color") —
+/// drop in a later cleanup migration.
+/// A single color role of a palette: the shadcn token name as `role`
+/// (background, foreground, primary, primary-foreground, muted, border,
+/// accent) and the resolved value. Rows-per-role keeps the shape open.
+model BrandColor {
+  id        String @id
+  paletteId String
+  role      String
+  /// #rrggbb (validated in the API).
+  value     String
+
+  palette BrandPalette @relation(fields: [paletteId], references: [id], onDelete: Cascade)
+
+  @@unique([paletteId, role])
+}
+
+/// DEPRECATED (KUK-918): superseded by DesignToken (category
+/// "typography") — drop in a later cleanup migration.
+/// One typography role of the kit ('heading' | 'body' | 'display'). Shared
+/// across modes — only colors vary per mode. `stack` is the CSS font-family
+/// value; the font rows below carry the loading info.
+model BrandTypography {
+  id    String @id
+  kitId String
+  role  String
+  stack String
+
+  kit BrandKit @relation(fields: [kitId], references: [id], onDelete: Cascade)
+
+  @@unique([kitId, role])
+}
+
+/// DEPRECATED (KUK-918): superseded by DesignToken (category "font",
+/// value = JSON loading info) — drop in a later cleanup migration.
+/// Font loading info for one family used by the kit's typography. Fonts are
+/// modeled (source + weights + italic), never stored as raw HTML/link
+/// snippets — a later ticket generates the CSS/HTML from these rows.
+model BrandFont {
+  id     String  @id
+  kitId  String
+  family String
+  /// 'system' | 'google' | 'url'
+  source String  @default("google")
+  /// For source 'url' — the https stylesheet URL (validated in the API).
+  url    String?
+  /// Comma/semicolon-separated weights, e.g. "400;700" or "100..900".
+  weights String?
+  italic Boolean @default(false)
+  createdAt DateTime @default(now())
+
+  kit BrandKit @relation(fields: [kitId], references: [id], onDelete: Cascade)
+
+  @@index([kitId])
+}
+
+// ---------------------------------------------------------------------------
+// Normalized building-block design model (KUK-917)
+//
+// Every authored design concept becomes a queryable row: design tokens,
+// dummy-data collections, versioned web components, pages composed by
+// referencing pinned component versions, templates, user flows, and
+// versioned publications. Bytes (bundle JS/CSS, prerendered HTML, previews)
+// live in the DESIGNS R2 bucket keyed by the ids in these rows — rows carry
+// identity, ordering, pinning, and provenance only.
+// ---------------------------------------------------------------------------
+
+/// The project's structured design-token store (1:1). Supersedes the
+/// unstructured tokens.json snapshot in R2 and the BrandKit tables
+/// (deprecated; see KUK-918): tokens are queryable rows the agent can
+/// adopt from published designs and the composition engine renders as
+/// CSS custom properties.
+model DesignSystem {
+  id        String   @id @default(cuid())
+  projectId String   @unique
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  project Project       @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  tokens  DesignToken[]
+}
+
+/// One design token, rows-per-role: `category` is the token family
+/// ("color" | "spacing" | "radius" | "typography" | "font" | "shadow") and
+/// `role` the name within it (shadcn token names for colors, t-shirt sizes
+/// for spacing/radius, "heading"/"body"/"display" for typography).
+/// Composition renders these as `--tb-<category>-<role>` custom properties.
+model DesignToken {
+  id       String @id @default(cuid())
+  systemId String
+  /// Token family, e.g. "color" | "spacing" | "radius" | "typography" | "font" | "shadow".
+  category String
+  /// Role within the family, e.g. "primary", "md", "heading".
+  role     String
+  /// The resolved value: "#7c3aed", "8px", a font-family stack, ...
+  value    String
+
+  system DesignSystem @relation(fields: [systemId], references: [id], onDelete: Cascade)
+
+  @@unique([systemId, category, role])
+}
+
+/// A named dummy-data collection for a project ("users", "courses", ...).
+/// Components and pages bind to collections by name via PageBlock
+/// dataBindings; records render in `ordinal` order. Lives per project so
+/// remixing/forking a project can carry the data layer.
+model DataCollection {
+  id        String   @id @default(cuid())
+  projectId String
+  /// Binding key used by agent tools and dataBindings, e.g. "courses".
+  name      String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  project Project      @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  records DataRecord[]
+
+  @@unique([projectId, name])
+  @@index([projectId, createdAt])
+}
+
+/// One dummy-data record. `ordinal` is the stable display order (re-seeding
+/// preserves positions of untouched records); `data` is a JSON blob — D1 is
+/// SQLite, which has no native JSON type (same convention as Message.attachments).
+model DataRecord {
+  id           String @id @default(cuid())
+  collectionId String
+  /// 0-based stable display order.
+  ordinal      Int
+  /// JSON record body, e.g. {"title":"Intro to SQL","price":"$49"}.
+  data         String
+
+  collection DataCollection @relation(fields: [collectionId], references: [id], onDelete: Cascade)
+
+  @@unique([collectionId, ordinal])
+}
+
+/// A reusable building block: the stable identity (name, kind, tagName) and
+/// the pointer to its currently published version. All authored content
+/// lives in ComponentVersion rows — this row never carries HTML/JS, so
+/// publishing a new version can never mutate existing pages (manual re-pin,
+/// KUK-917 plan decision). Soft-deleted components keep serving pinned
+/// versions.
+model Component {
+  id                 String    @id @default(cuid())
+  projectId          String
+  /// Library name, e.g. "Hero", "PricingTable". Unique per project; the
+  /// agent addresses components by it.
+  name               String
+  /// "layout" | "section" | "element".
+  kind               String
+  /// Custom-element tag name ("tb-hero"). Unique per project; fixed for the
+  /// component's lifetime — versions change content, never the tag.
+  tagName            String
+  /// The one published version (manual re-pin pointer). Unique so a second
+  /// publish must first retire the current one; SetNull only fires through
+  /// storage-level deletions that the handlers guard against.
+  publishedVersionId String?   @unique
+  /// Provenance: chat turn that created the component.
+  createdTurnId      String?
+  /// Soft delete: components pinned by pages/publications are never
+  /// hard-deleted; handlers set deletedAt and hide the row from the library.
+  deletedAt          DateTime?
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+
+  project          Project            @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  versions         ComponentVersion[] @relation("ComponentVersions")
+  publishedVersion ComponentVersion?  @relation("ComponentPublishedVersion", fields: [publishedVersionId], references: [id], onDelete: SetNull)
+
+  @@unique([projectId, name])
+  @@unique([projectId, tagName])
+  @@index([projectId, createdAt])
+}
+
+/// An immutable, versioned snapshot of a component's authored content.
+/// Append-only: agent edits always create a new row (status "draft");
+/// publishing flips one draft to "published" and retires the previous
+/// published row via the Component pointer. Never updated in place after
+/// publication — restore creates a new version (same semantics as
+/// design-version restore).
+model ComponentVersion {
+  id            String   @id @default(cuid())
+  componentId   String
+  /// 1-based, monotonic per component.
+  version       Int
+  /// "draft" | "published" | "retired". Only one published row per
+  /// component (enforced by Component.publishedVersionId uniqueness).
+  status        String   @default("draft")
+  /// Custom-element class source: `class extends HTMLElement {…}` +
+  /// one `customElements.define("<tagName>", …)`. Must respect the
+  /// `data-ssr` hydration convention (validated by the component validator).
+  js            String
+  /// Template markup (shadow template or light-DOM default content).
+  html          String?
+  /// Component styles, token-driven (var(--tb-…)); static strings only —
+  /// no runtime style injection, so publish can hoist them into <head>.
+  css           String?
+  /// "light" (default, token-friendly + SSR-trivial) | "open". "closed" is
+  /// rejected by the validator — it breaks the editor inspector.
+  shadowMode    String   @default("light")
+  /// JSON contract: { attributes: {name: {type, description}}, slots: [name],
+  /// events: [name] }. Attributes are strings; complex data goes through the
+  /// JSON slot-child convention.
+  apiSchema     String?
+  /// JSON of default attribute values, validated against apiSchema.
+  defaults      String?
+  /// R2 key of this version's rendered preview PNG (inspector thumbnails).
+  previewR2Key  String?
+  /// Human/agent change summary, e.g. "tightened spacing".
+  changeNote    String?
+  /// Provenance: chat turn that authored this version.
+  createdTurnId String?
+  createdAt     DateTime @default(now())
+
+  component          Component      @relation("ComponentVersions", fields: [componentId], references: [id], onDelete: Cascade)
+  /// The component's currently published version (back-reference of
+  /// Component.publishedVersionId).
+  publishedVersionOf Component?     @relation("ComponentPublishedVersion")
+  /// Pages/templates pinning this exact version (manual re-pin model —
+  /// never re-pointed automatically).
+  pageBlocks         PageBlock[]
+  templateSlots      TemplateSlot[]
+
+  @@unique([componentId, version])
+  @@index([componentId, status])
+}
+
+/// A page-level blueprint: an ordered slot list over the component library.
+/// Instantiating a template into a page copies the slot pins into PageBlock
+/// rows, capturing exact versions at instantiation time.
+model Template {
+  id        String   @id @default(cuid())
+  projectId String
+  name      String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  project    Project        @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  slots      TemplateSlot[]
+  /// Page blocks instantiating this template.
+  pageBlocks PageBlock[]
+
+  @@unique([projectId, name])
+  @@index([projectId, createdAt])
+}
+
+/// One ordered slot of a template. Pins an exact ComponentVersion
+/// (immutable snapshot) with optional per-slot prop overrides.
+model TemplateSlot {
+  id                 String  @id @default(cuid())
+  templateId         String
+  /// 0-based display order.
+  ordinal            Int
+  /// Pinned component version; SetNull only through storage-level deletes
+  /// (handlers guard pinned versions).
+  componentVersionId String?
+  /// JSON prop overrides for this slot, validated against the pinned
+  /// version's apiSchema.
+  propsOverrides     String?
+
+  template         Template          @relation(fields: [templateId], references: [id], onDelete: Cascade)
+  componentVersion ComponentVersion? @relation(fields: [componentVersionId], references: [id], onDelete: SetNull)
+
+  @@unique([templateId, ordinal])
+}
+
+/// A real page in a project's site: an ordered composition of building
+/// blocks. `path` makes it a navigable site ("/", "/pricing"), not a doc.
+/// Pages are project assets; deleting the authoring design workspace
+/// detaches (SetNull) rather than destroying them.
+model Page {
+  id        String   @id @default(cuid())
+  projectId String
+  /// Design workspace that authored/owns this page; null after the design
+  /// is deleted (pages survive their workspace).
+  designId  String?
+  /// Site path, e.g. "/" or "/pricing". Unique per project.
+  path      String
+  title     String
+  /// "draft" | "published". Publication snapshots render published pages;
+  /// the composition engine can render drafts for studio preview.
+  status    String   @default("draft")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  project   Project     @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  design    Design?     @relation(fields: [designId], references: [id], onDelete: SetNull)
+  blocks    PageBlock[]
+  flowSteps FlowStep[]
+
+  @@unique([projectId, path])
+  @@index([projectId, createdAt])
+}
+
+/// One usage of a building block on a page — THE reference between a page
+/// and a component. Pins an exact ComponentVersion (never auto-re-pointed;
+/// manual re-pin per the KUK-917 plan), carries per-usage props and dummy
+/// data bindings, and allows one-off inline HTML as an escape hatch
+/// (exactly one of componentVersionId / templateId / sourceHtml is set —
+/// validated in the handlers, not the DB).
+model PageBlock {
+  id                 String  @id @default(cuid())
+  pageId             String
+  /// 0-based display order — the page's DOM order is blocks sorted by this.
+  ordinal            Int
+  /// Pinned component version (immutable). SetNull only through
+  /// storage-level deletes; handlers reject deleting pinned versions.
+  componentVersionId String?
+  /// Instantiated template (its slots expand in the composition engine).
+  templateId         String?
+  /// One-off inline HTML escape hatch when no library component fits.
+  sourceHtml         String?
+  /// JSON prop overrides merged over the pinned version's defaults.
+  propsOverrides     String?
+  /// JSON bindings: { "items": { "collection": "courses", "limit": 6 } } —
+  /// resolved from DataCollection/DataRecord at render time.
+  dataBindings       String?
+
+  page             Page              @relation(fields: [pageId], references: [id], onDelete: Cascade)
+  componentVersion ComponentVersion? @relation(fields: [componentVersionId], references: [id], onDelete: SetNull)
+  template         Template?         @relation(fields: [templateId], references: [id], onDelete: SetNull)
+
+  @@unique([pageId, ordinal])
+}
+
+/// A named user journey across pages ("Onboarding", "Checkout"). Steps are
+/// ordered page refs with the transition action in/out of each step, so the
+/// studio can step through a whole flow in the preview pane.
+model Flow {
+  id        String   @id @default(cuid())
+  projectId String
+  name      String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  project Project    @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  steps   FlowStep[]
+
+  @@unique([projectId, name])
+  @@index([projectId, createdAt])
+}
+
+/// One step of a flow: the page it shows plus how the user enters and exits
+/// it (selectors/actions resolved by the preview player, never raw JS).
+model FlowStep {
+  id          String  @id @default(cuid())
+  flowId      String
+  /// 0-based journey order.
+  ordinal     Int
+  pageId      String
+  /// How the user arrives here, e.g. "click .cta on previous step".
+  entryAction String?
+  /// Action/selector that leads to the next step, e.g. "submit form".
+  exitTarget  String?
+
+  flow Flow @relation(fields: [flowId], references: [id], onDelete: Cascade)
+  page Page @relation(fields: [pageId], references: [id], onDelete: Cascade)
+
+  @@unique([flowId, ordinal])
+  @@index([pageId])
+}
+
+/// A versioned publication of a design: the composed, prerendered site
+/// snapshot. Replaces R2-key-derived version history with DB rows. The
+/// `manifest` records the resolved block→component-version pins at publish
+/// time, making every publication byte-reproducible from its row.
+model Publication {
+  id            String   @id @default(cuid())
+  designId      String
+  /// 1-based, monotonic per design.
+  version       Int
+  /// R2 key of the prerendered site bundle (designs/<id>/publications/<v>/…).
+  renderedR2Key String
+  /// R2 key of the full-page preview PNG (same render session).
+  previewR2Key  String?
+  /// JSON manifest of resolved pins at publish time:
+  /// { pages: [{ path, blocks: [{ blockId, componentVersionId, bundleUrl }] }] }.
+  manifest      String?
+  createdAt     DateTime @default(now())
+
+  design Design @relation(fields: [designId], references: [id], onDelete: Cascade)
+
+  @@unique([designId, version])
+  @@index([designId, createdAt])
+}
+
+
+// ---------------------------------------------------------------------------
+// Better Auth generated tables (user / session / account / verification)
+// Includes the admin plugin columns: user.role/banned/banReason/banExpires,
+// session.impersonatedBy. Column names/types are the contract with the
+// better-auth runtime — `pnpm auth:generate` (CLI @^1.2.12, same as
+// actor-node) detects column drift but omits Prisma-level defaults and
+// indexes by design, so its raw output is a subset of the models below.
+// ---------------------------------------------------------------------------
+
+model user {
+  id            String   @id
+  name          String
+  email         String   @unique
+  emailVerified Boolean  @default(false)
+  image         String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  /// admin plugin
+  role        String?
+  banned      Boolean? @default(false)
+  banReason   String?
+  banExpires  DateTime?
+
+  session      session[]
+  account      account[]
+  AgentCredential AgentCredential[]
+}
+
+model session {
+  id        String   @id
+  userId    String
+  token     String   @unique
+  expiresAt DateTime
+  ipAddress String?
+  userAgent String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  /// admin plugin (impersonation)
+  impersonatedBy String?
+
+  user user @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model account {
+  id        String   @id
+  userId    String
+  accountId String
+  providerId String
+  accessToken  String?
+  refreshToken String?
+  idToken      String?
+  accessTokenExpiresAt  DateTime?
+  refreshTokenExpiresAt DateTime?
+  scope      String?
+  password   String?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  user user @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model verification {
+  id         String   @id
+  identifier String
+  value      String
+  expiresAt  DateTime
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([identifier])
+}

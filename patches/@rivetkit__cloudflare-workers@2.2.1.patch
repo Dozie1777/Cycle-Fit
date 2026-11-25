@@ -1,0 +1,103 @@
+diff --git a/dist/mod.cjs b/dist/mod.cjs
+index eaae347f8ace046ab0495fa265d30761b88cbfd1..7f21488b8cfc5c921d7440261e275eb6c8da8d95 100644
+--- a/dist/mod.cjs
++++ b/dist/mod.cjs
+@@ -192,7 +192,8 @@ var STANDARD_WEBSOCKET_HEADERS = [
+   "sec-websocket-key",
+   "sec-websocket-version",
+   "sec-websocket-protocol",
+-  "sec-websocket-extensions"
++  "sec-websocket-extensions",
++  "cookie"
+ ];
+ var CloudflareActorsManagerDriver = class {
+   async sendRequest(actorId, actorRequest) {
+@@ -752,6 +753,15 @@ var CloudflareActorsActorDriver = class {
+   async getDatabase(actorId) {
+     return this.#getDOCtx(actorId).storage.sql;
+   }
++  async overrideRawDatabaseClient(actorId) {
++    const sql = this.#getDOCtx(actorId).storage.sql;
++    return {
++      exec: async (query, ...args) => {
++        const cursor = sql.exec(query, ...args);
++        return cursor.toArray();
++      }
++    };
++  }
+   // Batch KV operations
+   async kvBatchPut(actorId, entries) {
+     const sql = this.#getDOCtx(actorId).storage.sql;
+diff --git a/dist/mod.js b/dist/mod.js
+index 5ce021dc149051135233fb585e9b22a2c75acc97..87d660b4822f41a8420bb4b3c4d53e2a63d2bc2d 100644
+--- a/dist/mod.js
++++ b/dist/mod.js
+@@ -192,7 +192,8 @@ var STANDARD_WEBSOCKET_HEADERS = [
+   "sec-websocket-key",
+   "sec-websocket-version",
+   "sec-websocket-protocol",
+-  "sec-websocket-extensions"
++  "sec-websocket-extensions",
++  "cookie"
+ ];
+ var CloudflareActorsManagerDriver = class {
+   async sendRequest(actorId, actorRequest) {
+@@ -752,6 +753,15 @@ var CloudflareActorsActorDriver = class {
+   async getDatabase(actorId) {
+     return this.#getDOCtx(actorId).storage.sql;
+   }
++  async overrideRawDatabaseClient(actorId) {
++    const sql = this.#getDOCtx(actorId).storage.sql;
++    return {
++      exec: async (query, ...args) => {
++        const cursor = sql.exec(query, ...args);
++        return cursor.toArray();
++      }
++    };
++  }
+   // Batch KV operations
+   async kvBatchPut(actorId, entries) {
+     const sql = this.#getDOCtx(actorId).storage.sql;
+diff --git a/src/actor-driver.ts b/src/actor-driver.ts
+index 58267e243da86926e9ef15085abcfeed8a2b29b5..8cf4ca9a0d07c50b898dcec1ca2e0eaed93defb9 100644
+--- a/src/actor-driver.ts
++++ b/src/actor-driver.ts
+@@ -10,6 +10,7 @@ import type {
+ 	ActorDriver,
+ 	AnyActorInstance,
+ 	ManagerDriver,
++	RawDatabaseClient,
+ } from "rivetkit/driver-helpers";
+ import { promiseWithResolvers } from "rivetkit/utils";
+ import { logger } from "./log";
+@@ -234,6 +235,18 @@ export class CloudflareActorsActorDriver implements ActorDriver {
+ 		return this.#getDOCtx(actorId).storage.sql;
+ 	}
+ 
++	async overrideRawDatabaseClient(
++		actorId: string,
++	): Promise<RawDatabaseClient | undefined> {
++		const sql = this.#getDOCtx(actorId).storage.sql;
++		return {
++			exec: async (query, ...args) => {
++				const cursor = sql.exec(query, ...args);
++				return cursor.toArray();
++			},
++		};
++	}
++
+ 	// Batch KV operations
+ 	async kvBatchPut(
+ 		actorId: string,
+diff --git a/src/manager-driver.ts b/src/manager-driver.ts
+index 729379fb23979a1bce17564f3a1fa60f9fc654af..87c46f929127d04f5a9d223e899b4128bca85c4b 100644
+--- a/src/manager-driver.ts
++++ b/src/manager-driver.ts
+@@ -34,6 +34,7 @@ const STANDARD_WEBSOCKET_HEADERS = [
+ 	"sec-websocket-version",
+ 	"sec-websocket-protocol",
+ 	"sec-websocket-extensions",
++	"cookie"
+ ];
+ 
+ export class CloudflareActorsManagerDriver implements ManagerDriver {

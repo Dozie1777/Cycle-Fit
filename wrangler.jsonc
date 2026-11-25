@@ -1,0 +1,141 @@
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "code-review-bot",
+	"main": "src/server.ts",
+	// >= 2025-09-15 required by @cloudflare/playwright (Browser Rendering).
+	// >= 2026-03-03 reports unhandled rejections after the microtask checkpoint.
+	"compatibility_date": "2026-03-03",
+	// Workaround for https://github.com/prisma/orm/issues/28732: Prisma's
+	// DataLoader (dispatchBatches) resolves promises from a different request
+	// context; without this flag workerd cancels those continuations and auth
+	// requests hang (invocation outcome "canceled", ~1 in 6 sign-ins).
+	// Remove once Prisma patches dispatchBatches().
+	"compatibility_flags": [
+		"nodejs_compat",
+		"no_handle_cross_request_promise_resolution"
+	],
+	"observability": {
+		"enabled": true
+	},
+	"vars": {
+		// Kimi Code — design sessions + interactive terminal sessions.
+		"KIMI_MODEL_NAME": "kimi-for-coding-highspeed",
+		"KIMI_MODEL_PROVIDER_TYPE": "kimi",
+		"KIMI_MODEL_BASE_URL": "https://api.kimi.com/coding/v1",
+		// Kimi Code — sandboxed PR review checks (lib/review.ts synthesizes
+		// the model via the KIMI_MODEL_* env family). K3.1 Pro only supports
+		// thinking mode and defaults to max effort; low keeps thinking short.
+		"REVIEW_KIMI_MODEL_NAME": "kimi-k3.1-pro-highspeed",
+		"REVIEW_KIMI_THINKING_EFFORT": "low",
+		// Daily whole-codebase review (src/features/review/daily-review.ts,
+		// triggered by the cron below).
+		"DAILY_REVIEW_REPO": "Eden-Kukuana-PLC/kukuana",
+		// Public origin the review sandbox posts fenced submissions to.
+		"DAILY_REVIEW_ORIGIN": "https://code-review-bot.uplanit.workers.dev",
+		"ENVIRONMENT": "production",
+		"INSTALLATION_ID": "150708719",
+		"CLOUDFLARE_ACCOUNT_ID": "c45688b6c27db47659026bb3d520cad3"
+	},
+	// Cron Triggers run in UTC. 05:00 UTC is 06:00 West Africa Time (the
+	// team's timezone) — the daily codebase review lands by 6am. Fires the
+	// `scheduled` handler in src/server.ts, which runs
+	// startDailyCodebaseReview(): a sandboxed review of the default branch
+	// that completes the "Daily Codebase Review" check run and opens a
+	// GitHub issue when it finds problems.
+	"triggers": {
+		"crons": ["0 5 * * *"]
+	},
+	// Workers AI — design chat inference (workers-ai-provider, GLM-5.3).
+	// remote: true suppresses the local-dev "AI bindings always access remote
+	// resources" warning. In tests the provider is mocked, so no remote calls
+	// are made.
+	"ai": {
+		"binding": "AI",
+		"remote": true
+	},
+	// Browser Rendering — preview screenshots + the Playwright MCP server.
+	// remote: true is required in local dev; Browser Run has no local simulation.
+	"browser": {
+		"binding": "BROWSER",
+		"remote": true
+	},
+	// Self service binding: the design chat's MCP client talks to this same
+	// worker's /browser-mcp endpoint. Routing through a service binding
+	// avoids network self-calls, which the local dev runtime (workerd) does
+	// not support — "internal error" on loopback fetches.
+	"services": [
+		{
+			"binding": "SELF",
+			"service": "code-review-bot"
+		}
+	],
+	// RivetKit actor driver (src/server/rivet/): global actor metadata KV +
+	// the ActorHandler Durable Object that fronts every actor.
+	"kv_namespaces": [
+		{
+			"binding": "ACTOR_KV",
+			"id": "4dae66d3deb04944a390fa8484c034eb"
+		}
+	],
+	"r2_buckets": [
+		{
+			"binding": "WORKING_DIR",
+			"bucket_name": "working-dir-bucket"
+		},
+		// Generated design workspaces, one <id>/ directory per Design.
+		// Shares working-dir-bucket with the review pipeline (distinct
+		// `designs/` key prefix) — the R2 S3 token that signs agent uploads
+		// is scoped to this bucket (env.S3_BUCKET must match).
+		{
+			"binding": "DESIGNS",
+			"bucket_name": "working-dir-bucket"
+		}
+	],
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "code-review-bot",
+			"database_id": "a6b74674-f8d7-432f-9cfb-7b44d4583e5c",
+			"migrations_dir": "prisma/migrations",
+			"migrations_pattern": "prisma/migrations/*/migration.sql"
+		}
+	],
+	"containers": [
+		{
+			"class_name": "Sandbox",
+			"image": "./Dockerfile",
+			"instance_type": "standard-3",
+			"max_instances": 50
+		}
+	],
+	"durable_objects": {
+		"bindings": [
+			{
+				"class_name": "Sandbox",
+				"name": "Sandbox"
+			},
+			{
+				"class_name": "PlaywrightMCP",
+				"name": "MCP_OBJECT"
+			},
+			{
+				"class_name": "ActorHandler",
+				"name": "ACTOR_DO"
+			}
+		]
+	},
+	"migrations": [
+		{
+			"new_sqlite_classes": ["Sandbox"],
+			"tag": "v1"
+		},
+		{
+			"new_sqlite_classes": ["PlaywrightMCP"],
+			"tag": "v2"
+		},
+		{
+			"new_sqlite_classes": ["ActorHandler"],
+			"tag": "v3"
+		}
+	]
+}
