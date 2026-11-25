@@ -1,0 +1,60 @@
+# Copy to .dev.vars and fill in real values for the Start dev server.
+# .dev.vars is gitignored; never commit or print real values.
+KIMI_API_KEY=sk-your-kimi-api-key
+ENVIRONMENT=local
+# The key and its platform must match, or every call fails with
+# "401 Invalid Authentication" — the two platforms' keys are NOT
+# interchangeable:
+#
+# Kimi Code membership key (from the kimi.com console) — these are the
+# defaults, no need to set:
+# KIMI_MODEL_BASE_URL=https://api.kimi.com/coding/v1
+# KIMI_MODEL_NAME=kimi-for-coding
+# KIMI_MODEL_PROVIDER_TYPE=kimi
+#
+# Sandboxed PR review checks pin their own model via the KIMI_MODEL_* env
+# family (see lib/review.ts); defaults live in wrangler.jsonc:
+# REVIEW_KIMI_MODEL_NAME=kimi-k3.1-pro-highspeed
+# REVIEW_KIMI_THINKING_EFFORT=low
+#
+# Kimi Open Platform key (from platform.kimi.com / platform.moonshot.cn):
+# KIMI_MODEL_BASE_URL=https://api.moonshot.cn/v1
+
+# GitHub App credentials used to verify webhooks and mint installation tokens.
+APP_ID=123456
+WEBHOOK_SECRET=change-me
+OCTOKIT_PRIVATE_KEY=replace-with-pkcs1-private-key
+# Numeric installation ID for your org/repo
+# (GET /repos/{owner}/{repo}/installation, or the URL of the app's
+# installation page: github.com/organizations/{org}/settings/installations/{id})
+INSTALLATION_ID=12345678
+# Random string guarding the /github-token endpoint (e.g. `openssl rand -hex 32`)
+TOKEN_REFRESH_SECRET=change-me
+
+# --- Agent credentials (Phase 1: scaffold) -----------------------------------
+# Master keys for encrypting credential payloads at rest (AES-256-GCM).
+# AGENT_CRED_MASTER_KEYS is a JSON map of key version -> base64-encoded 32-byte
+# key. Rotate by adding a new version (never removing old ones while rows
+# reference them) and bumping AGENT_CRED_MASTER_KEY_CURRENT.
+# Generate a key: openssl rand -base64 32
+AGENT_CRED_MASTER_KEYS={"1":"base64-of-32-random-bytes"}
+AGENT_CRED_MASTER_KEY_CURRENT=1
+# Better Auth secret for signing sessions (openssl rand -base64 32).
+BETTER_AUTH_SECRET=change-me
+
+# --- Design studio uploads --------------------------------------------------
+# An R2 API token (S3-compatible credentials) with Object Read & Write on the
+# designs bucket. The worker presigns per-key PUT URLs with it — design agents
+# upload files themselves and never see these. Create in the dashboard: R2 ->
+# Manage R2 API tokens -> Create Account API token -> Object Read & Write ->
+# Apply to specific buckets only -> the value of S3_BUCKET (the bucket the
+# DESIGNS binding serves from).
+S3_ACCESS_KEY_ID=your-r2-access-key-id
+S3_SECRET_ACCESS_KEY=your-r2-secret-access-key
+# Bucket name (not a secret); must match the DESIGNS/WORKING_DIR binding.
+S3_BUCKET=working-dir-bucket
+# CLOUDFLARE_ACCOUNT_ID is committed as a wrangler var (not a secret); no need
+# to set it here.
+
+# Shared bearer token for the /browser-mcp Playwright MCP endpoint (design chat browser tools).
+BROWSER_MCP_TOKEN=dev-token-change-me

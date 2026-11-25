@@ -1,0 +1,39 @@
+diff --git a/dist/pool/index.mjs b/dist/pool/index.mjs
+index 527e22ea53904a3457e135636b5fa65c6433127c..133fb03cbcf253a433bc8372a327ae436305382b 100644
+--- a/dist/pool/index.mjs
++++ b/dist/pool/index.mjs
+@@ -69303,7 +69303,8 @@ function inlineCachedModule(module$1, cacheContents) {
+ * `fetch()` returns one module result; `fetchWarmModules()` returns a map of
+ * module IDs to results. Vitest checks the map before calling `fetch()`, so
+ * both paths need inlining. Reuse reads within this reply because aliases in
+-* the map can reference the same cache file.
++* the map can reference the same cache file. Cap warm replies below workerd's
++* 32 MiB WebSocket limit and let Vitest fetch omitted modules individually.
+ */
+ function inlineCachedModules(response) {
+ 	const cacheContents = /* @__PURE__ */ new Map();
+@@ -69315,9 +69316,15 @@ function inlineCachedModules(response) {
+ 	}
+ 	if (inlined !== response || response === null || typeof response !== "object" || Array.isArray(response)) return inlined;
+ 	let hasCachedModules = false;
++	let remainingBudget = 24 * 1024 * 1024;
+ 	const entries = Object.entries(response).flatMap(([specifier, module$1]) => {
+ 		try {
+ 			const inlinedModule = inlineCachedModule(module$1, cacheContents);
++			remainingBudget -= Buffer.byteLength(stringify$1(inlinedModule ?? null, structuredSerializableReducers));
++			if (remainingBudget < 0) {
++				hasCachedModules = true;
++				return [];
++			}
+ 			hasCachedModules ||= inlinedModule !== module$1;
+ 			return [[specifier, inlinedModule]];
+ 		} catch {
+@@ -69727,4 +69734,7 @@
+ 	runnerWorker.name = getRunnerName(project);
+ 	runnerWorker.compatibilityFlags ??= [];
+-	runnerWorker.compatibilityFlags.push("no_handle_cross_request_promise_resolution");
++	// workerd fails startup on a duplicated compatibility flag; the wrangler
++	// config may already carry this one (Prisma requires it in production).
++	if (!runnerWorker.compatibilityFlags.includes("no_handle_cross_request_promise_resolution"))
++		runnerWorker.compatibilityFlags.push("no_handle_cross_request_promise_resolution");
+ 	if (runnerWorker.compatibilityDate === void 0) {

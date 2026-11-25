@@ -1,0 +1,136 @@
+{
+	"$schema": "https://biomejs.dev/schemas/2.4.16/schema.json",
+	"vcs": {
+		"enabled": true,
+		"clientKind": "git",
+		"useIgnoreFile": true,
+		"defaultBranch": "main"
+	},
+	"files": {
+		"ignoreUnknown": false,
+		"includes": [
+			"**/*",
+			"!**/.wrangler",
+			"!**/worker-configuration.d.ts",
+			"!src/routeTree.gen.ts",
+			"!src/components/ui",
+			"!src/components/ai-elements",
+			"!src/lib/utils.ts"
+		]
+	},
+	"formatter": {
+		"enabled": true,
+		"indentStyle": "tab"
+	},
+	"linter": {
+		"enabled": true,
+		"rules": {
+			"recommended": true,
+			"suspicious": {
+				"noDuplicateProperties": "off",
+				"noDuplicateCustomProperties": "off"
+			}
+		}
+	},
+	"overrides": [
+		{
+			// Module boundaries:
+			// - never import test files or golden snapshots from product code
+			"includes": ["src/**/*"],
+			"linter": {
+				"rules": {
+					"style": {
+						"noRestrictedImports": {
+							"level": "error",
+							"options": {
+								"patterns": [
+									{
+										"group": [
+											"**/*.test.ts",
+											"**/*.test.tsx",
+											"**/*.test.mjs",
+											"**/__snapshots__/**"
+										],
+										"message": "Import the module implementation, not its test file."
+									}
+								]
+							}
+						}
+					}
+				}
+			}
+		},
+		{
+			// The skills and review modules expose their public API through
+			// their index barrel; cross-module imports must not reach into
+			// their internals. Applies to every consumer outside the module.
+			"includes": [
+				"src/**/*",
+				"!src/features/skills/**/*",
+				"!src/features/review/**/*"
+			],
+			"linter": {
+				"rules": {
+					"style": {
+						"noRestrictedImports": {
+							"level": "error",
+							"options": {
+								"patterns": [
+									{
+										"group": [
+											"@/features/skills/*",
+											"!@/features/skills/index"
+										],
+										"message": "Import through the module barrel (@/features/skills), not its internals."
+									},
+									{
+										"group": [
+											"@/features/review/*",
+											"!@/features/review/index"
+										],
+										"message": "Import through the module barrel (@/features/review), not its internals."
+									}
+								]
+							}
+						}
+					}
+				}
+			}
+		},
+		{
+			// The browser data layer additionally never touches server infra.
+			"includes": ["src/client/**/*"],
+			"linter": {
+				"rules": {
+					"style": {
+						"noRestrictedImports": {
+							"level": "error",
+							"options": {
+								"patterns": [
+									{
+										"group": ["@/lib/**"],
+										"message": "src/client is the browser data layer — import server infra through tRPC or feature modules, not @/lib."
+									}
+								]
+							}
+						}
+					}
+				}
+			}
+		}
+	],
+	"javascript": {
+		"formatter": {
+			"quoteStyle": "double"
+		}
+	},
+	"assist": {
+		"enabled": true,
+		"actions": {
+			"source": {
+				"organizeImports": "on"
+			}
+		}
+	},
+	"css": { "parser": { "tailwindDirectives": true } }
+}

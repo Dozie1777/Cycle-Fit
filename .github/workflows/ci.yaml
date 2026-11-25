@@ -1,0 +1,99 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  format:
+    name: Format & Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.0.0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.12.0
+          # No pnpm cache: this job never installs dependencies, so the store
+          # directory does not exist and the post-save step fails whenever the
+          # lockfile changes invalidate the restore key.
+          cache: ""
+
+      - name: Setup Biome
+        uses: biomejs/setup-biome@v2
+        with:
+          version: 2.4.16
+
+      - name: Check formatting and lint
+        run: biome check .
+
+  tests:
+    name: Tests
+    needs: [format]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.0.0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.12.0
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run unit, artifact, and workflow contract tests
+        run: pnpm test
+
+      # TODO: Re-enable the workerd integration suite once it is optimised;
+      # it currently takes ~20 minutes to complete.
+      # - name: Run workerd integration tests (D1 migrations, API, auth)
+      #   run: pnpm exec vitest run --project workers
+
+      - name: Run route and router tests
+        run: pnpm exec vitest run --project unit test/router.test.ts test/routes.test.tsx
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Build Start client and Worker
+        run: pnpm build
+
+      - name: Audit production artifacts
+        run: pnpm verify:build
+
+      - name: Generate Cloudflare types
+        run: pnpm cf-typegen
+
+      - name: Check generated files
+        run: git diff --exit-code -- worker-configuration.d.ts src/routeTree.gen.ts
+
+      # - name: Dry-run generated Worker deployment
+      #   run: pnpm exec wrangler deploy --dry-run --config dist/server/wrangler.json
